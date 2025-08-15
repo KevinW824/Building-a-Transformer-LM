@@ -9,105 +9,9 @@ import json
 import sys
 import multiprocessing as mp
 from cs336_basics.bpe import (
-    pretokenize_file, 
-    train_bpe_from_pre_tokens,
-    vocabulary_initialization,
-    find_most_frequent_pair,
-    apply_merge_and_track_changes,
-    update_pair_counts,
-    count_pairs_in_sequence
+    pretokenize_file,
+    train_bpe_from_pre_tokens_indexed,
 )
-from collections import Counter
-
-def train_bpe_from_pre_tokens_with_progress(pre_tokens, vocab_size, special_tokens, target_merges):
-    """Train BPE with progress tracking."""
-    if special_tokens is None:
-        special_tokens = []
-    
-    # Initialize vocabulary with special tokens and byte tokens
-    vocab = vocabulary_initialization(special_tokens)
-    merges = []
-    
-    # Current pre-tokens (will be updated as we merge)
-    current_pre_tokens = pre_tokens.copy()
-    
-    # Precompute special tokens bytes for efficiency
-    special_tokens_bytes = {tuple([token.encode('utf-8')]) for token in special_tokens}
-    
-    # Initialize pair counts cache
-    pair_counts = Counter()
-    for token_sequence, freq in current_pre_tokens.items():
-        if token_sequence in special_tokens_bytes:
-            continue
-        sequence_pairs = count_pairs_in_sequence(token_sequence)
-        for pair, count in sequence_pairs.items():
-            pair_counts[pair] += freq * count
-    
-    # Progress tracking
-    start_time = time.time()
-    last_progress_time = start_time
-    
-    while len(vocab) < vocab_size and pair_counts:
-        # Find the most frequent pair
-        best_pair = find_most_frequent_pair(pair_counts)
-        
-        # Add the merge to our list and vocabulary
-        merges.append(best_pair)
-        merged_token = best_pair[0] + best_pair[1]
-        vocab[len(vocab)] = merged_token
-        
-        # Progress reporting every 100 merges or every 30 seconds
-        current_merges = len(merges)
-        current_time = time.time()
-        
-        if (current_merges % 100 == 0 or 
-            current_time - last_progress_time > 30 or 
-            current_merges == target_merges):
-            
-            elapsed_time = current_time - start_time
-            progress_pct = (current_merges / target_merges) * 100 if target_merges > 0 else 0
-            merges_per_sec = current_merges / elapsed_time if elapsed_time > 0 else 0
-            
-            # Estimate remaining time
-            if merges_per_sec > 0 and target_merges > current_merges:
-                remaining_merges = target_merges - current_merges
-                eta_seconds = remaining_merges / merges_per_sec
-                eta_minutes = eta_seconds / 60
-                
-                if eta_minutes > 60:
-                    eta_str = f"{eta_minutes/60:.1f}h"
-                elif eta_minutes > 1:
-                    eta_str = f"{eta_minutes:.1f}m"
-                else:
-                    eta_str = f"{eta_seconds:.0f}s"
-            else:
-                eta_str = "calculating..."
-            
-            # Show current merge info
-            try:
-                merged_str = merged_token.decode('utf-8')
-                if merged_str.isprintable() and len(merged_str) <= 10:
-                    merge_info = f'"{merged_str}"'
-                else:
-                    merge_info = f"{merged_token!r}"
-            except:
-                merge_info = f"{merged_token!r}"
-            
-            print(f"📊 Progress: {current_merges}/{target_merges} ({progress_pct:.1f}%) | "
-                  f"{merges_per_sec:.1f} merges/s | ETA: {eta_str} | "
-                  f"Latest: {merge_info}")
-            
-            last_progress_time = current_time
-        
-        # Apply merge and track changes to pair counts
-        current_pre_tokens, pair_changes = apply_merge_and_track_changes(
-            current_pre_tokens, best_pair, special_tokens_bytes
-        )
-        
-        # Update pair counts incrementally
-        update_pair_counts(pair_counts, pair_changes)
-    
-    return vocab, merges
 
 def main():
     # Get input file from command line argument
@@ -118,8 +22,9 @@ def main():
     
     # Configuration
     input_path = sys.argv[1]
-    vocab_size = int(sys.argv[2]) if len(sys.argv) > 2 else 10000  # Default to 10000
+    vocab_size = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 10000  # Default to 10000
     special_tokens = ["<|endoftext|>"]
+    # Always use the indexed trainer
     
     # Check if file exists
     if not os.path.exists(input_path):
@@ -157,11 +62,31 @@ def main():
     target_merges = vocab_size - 257 - len(special_tokens)  # 256 bytes + special tokens
     print(f"🚀 Starting BPE training: {target_merges} merges needed")
     
-    bpe_start = time.time()
-    vocab, merges = train_bpe_from_pre_tokens_with_progress(
-        pre_tokens, vocab_size, special_tokens, target_merges
+    last_print = {"t": time.time()}
+    def progress_cb(n_merges: int, merged_token: bytes):
+        now = time.time()
+        if (n_merges % 100 == 0) or (now - last_print["t"] > 30) or (n_merges == target_merges):
+            elapsed = now - total_start_time
+            merges_per_sec = n_merges / elapsed if elapsed > 0 else 0.0
+            remaining = max(0, target_merges - n_merges)
+            eta = remaining / merges_per_sec if merges_per_sec > 0 else float("inf")
+            if eta == float("inf"):
+                eta_str = "calculating..."
+            else:
+                eta_min = eta / 60
+                eta_str = f"{eta_min/60:.1f}h" if eta_min > 60 else (f"{eta_min:.1f}m" if eta_min > 1 else f"{eta:.0f}s")
+            try:
+                merged_str = merged_token.decode('utf-8')
+                merge_info = f'"{merged_str}"' if merged_str.isprintable() and len(merged_str) <= 10 else f"{merged_token!r}"
+            except Exception:
+                merge_info = f"{merged_token!r}"
+            pct = (n_merges / target_merges) * 100 if target_merges > 0 else 0
+            print(f"📊 Progress: {n_merges}/{target_merges} ({pct:.1f}%) | {merges_per_sec:.1f} merges/s | ETA: {eta_str} | Latest: {merge_info}")
+            last_print["t"] = now
+
+    vocab, merges = train_bpe_from_pre_tokens_indexed(
+        pre_tokens, vocab_size, special_tokens, progress_callback=progress_cb
     )
-    bpe_end = time.time()
     
     total_end_time = time.time()
     training_time = total_end_time - total_start_time

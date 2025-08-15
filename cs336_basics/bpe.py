@@ -1,6 +1,6 @@
 import regex as re
 from collections import Counter
-from typing import List, Tuple, Dict, BinaryIO
+from typing import List, Tuple, Dict, BinaryIO, Optional, Callable
 import multiprocessing as mp
 import os
 
@@ -203,38 +203,6 @@ def pretokenize_file(input_path: str, special_tokens: List[str] = None) -> Dict[
     return dict(merged_counts)
 
 
-def get_byte_pairs(pre_tokens: Dict[Tuple[bytes, ...], int], special_tokens: List[str] = None) -> Counter:
-    """
-    Count all adjacent byte pairs within each pre-token sequence.
-    
-    Args:
-        pre_tokens: Dictionary mapping pre-token sequences to their frequencies.
-        special_tokens: List of special tokens that should not be split.
-    
-    Returns:
-        Counter of byte pairs with their frequencies.
-    """
-    if special_tokens is None:
-        special_tokens = []
-    
-    # Convert special tokens to bytes for comparison
-    special_tokens_bytes = {tuple([token.encode('utf-8')]) for token in special_tokens}
-    
-    pair_counts = Counter()
-    
-    for token_sequence, freq in pre_tokens.items():
-        # Skip counting pairs within special tokens
-        if token_sequence in special_tokens_bytes:
-            continue
-        
-        # Count adjacent pairs in the token sequence
-        for i in range(len(token_sequence) - 1):
-            pair = (token_sequence[i], token_sequence[i + 1])
-            pair_counts[pair] += freq
-    
-    return pair_counts
-
-
 def apply_merge_to_token_sequence(token_sequence: Tuple[bytes, ...], pair: Tuple[bytes, bytes]) -> Tuple[bytes, ...]:
     """
     Apply a merge of two bytes to a token sequence.
@@ -265,35 +233,38 @@ def apply_merge_to_token_sequence(token_sequence: Tuple[bytes, ...], pair: Tuple
     return tuple(result)
 
 
-def apply_merge_to_pre_tokens(pre_tokens: Dict[Tuple[bytes, ...], int], pair: Tuple[bytes, bytes], special_tokens: List[str] = None) -> Dict[Tuple[bytes, ...], int]:
+def merge_sequence_and_count_pairs(
+    token_sequence: Tuple[bytes, ...],
+    pair: Tuple[bytes, bytes],
+) -> Tuple[Tuple[bytes, ...], Counter]:
     """
-    Apply a merge operation to all pre-token sequences, excluding special tokens.
-    
-    Args:
-        pre_tokens: Dictionary mapping pre-token sequences to their frequencies.
-        pair: The pair of bytes to merge.
-        special_tokens: List of special tokens that should not be modified.
-    
-    Returns:
-        Updated pre-tokens dictionary with the merge applied.
+    Merge all occurrences of `pair` in `token_sequence` in a single left-to-right pass,
+    and return both the merged sequence and its adjacent-pair counts.
+
+    This avoids counting pairs twice (before and after) for sequences that change.
     """
-    if special_tokens is None:
-        special_tokens = []
-    
-    # Convert special tokens to the format we use for comparison
-    special_tokens_bytes = {tuple([token.encode('utf-8')]) for token in special_tokens}
-    
-    new_pre_tokens = Counter()
-    
-    for token_sequence, freq in pre_tokens.items():
-        # Don't modify special tokens
-        if token_sequence in special_tokens_bytes:
-            new_pre_tokens[token_sequence] += freq
+    if len(token_sequence) < 2:
+        return token_sequence, Counter()
+
+    merged = []
+    i = 0
+    a, b = pair
+    while i < len(token_sequence):
+        if i < len(token_sequence) - 1 and token_sequence[i] == a and token_sequence[i + 1] == b:
+            merged.append(a + b)
+            i += 2
         else:
-            merged_sequence = apply_merge_to_token_sequence(token_sequence, pair)
-            new_pre_tokens[merged_sequence] += freq
-    
-    return dict(new_pre_tokens)
+            merged.append(token_sequence[i])
+            i += 1
+
+    merged_tuple = tuple(merged)
+
+    # Count adjacent pairs in the merged sequence
+    new_pairs = Counter()
+    for j in range(len(merged_tuple) - 1):
+        new_pairs[(merged_tuple[j], merged_tuple[j + 1])] += 1
+
+    return merged_tuple, new_pairs
 
 
 def find_most_frequent_pair(pair_counts: Counter) -> Tuple[bytes, bytes]:
@@ -409,6 +380,140 @@ def update_pair_counts(pair_counts: Counter, pair_changes: Counter) -> None:
             del pair_counts[pair]
 
 
+def train_bpe_from_pre_tokens_indexed(
+    pre_tokens: Dict[Tuple[bytes, ...], int],
+    vocab_size: int,
+    special_tokens: List[str] | None = None,
+    progress_callback: Optional[Callable[[int, bytes], None]] = None,
+) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+    """
+    Train BPE using an indexed approach to avoid scanning sequences that cannot change.
+
+    Maintains per-sequence pair counters and a mapping from pairs to sequences that
+    contain them, updating only affected sequences each merge.
+    """
+    if special_tokens is None:
+        special_tokens = []
+
+    vocab = vocabulary_initialization(special_tokens)
+    merges: List[Tuple[bytes, bytes]] = []
+
+    # Special-token sequences to skip
+    special_tokens_bytes = {tuple([token.encode('utf-8')]) for token in special_tokens}
+
+    # Sequence state: map sequence -> {"freq": int, "pairs": Counter}
+    sequence_state: Dict[Tuple[bytes, ...], Dict[str, object]] = {}
+    for seq, freq in pre_tokens.items():
+        if seq in special_tokens_bytes:
+            # Keep as is; no pairs inside
+            sequence_state[seq] = {"freq": freq, "pairs": Counter()}
+        else:
+            pc = count_pairs_in_sequence(seq)
+            sequence_state[seq] = {"freq": freq, "pairs": pc}
+
+    # Global pair counts and inverted index pair -> set(sequences)
+    pair_counts: Counter = Counter()
+    pair_to_sequences: Dict[Tuple[bytes, bytes], set] = {}
+    for seq, state in sequence_state.items():
+        freq: int = state["freq"]  # type: ignore[assignment]
+        pairs_counter: Counter = state["pairs"]  # type: ignore[assignment]
+        if not pairs_counter:
+            continue
+        for p, c in pairs_counter.items():
+            pair_counts[p] += freq * c
+        for p in pairs_counter.keys():
+            s = pair_to_sequences.get(p)
+            if s is None:
+                s = set()
+                pair_to_sequences[p] = s
+            s.add(seq)
+
+    # Main merge loop
+    while len(vocab) < vocab_size and pair_counts:
+        best_pair = find_most_frequent_pair(pair_counts)
+
+        # Add merge to vocab & history
+        merged_token = best_pair[0] + best_pair[1]
+        merges.append(best_pair)
+        vocab[len(vocab)] = merged_token
+
+        if progress_callback is not None:
+            try:
+                progress_callback(len(merges), merged_token)
+            except Exception:
+                pass
+
+        affected_sequences = list(pair_to_sequences.get(best_pair, set()))
+
+        # For each affected sequence, apply merge and update indices
+        for old_seq in affected_sequences:
+            # Sequence may have been removed/changed in a previous step within this iteration
+            old_state = sequence_state.get(old_seq)
+            if old_state is None:
+                continue
+
+            old_freq: int = old_state["freq"]  # type: ignore[assignment]
+            old_pairs: Counter = old_state["pairs"]  # type: ignore[assignment]
+
+            # Skip if sequence no longer actually contains the pair (lazy invalidation)
+            if old_pairs.get(best_pair, 0) == 0:
+                continue
+
+            # Remove old_seq membership from all pairs it used to have
+            for p in old_pairs.keys():
+                seqs = pair_to_sequences.get(p)
+                if seqs is not None and old_seq in seqs:
+                    seqs.discard(old_seq)
+                    if not seqs:
+                        pair_to_sequences.pop(p, None)
+
+            # Decrease global pair counts by old_pairs * freq
+            for p, c in old_pairs.items():
+                total_change = old_freq * c
+                new_val = pair_counts.get(p, 0) - total_change
+                if new_val > 0:
+                    pair_counts[p] = new_val
+                else:
+                    pair_counts.pop(p, None)
+
+            # Apply merge and compute new pair counts for the new sequence
+            new_seq, new_pairs = merge_sequence_and_count_pairs(old_seq, best_pair)
+
+            # Update or create new sequence state
+            existing_new = sequence_state.get(new_seq)
+            if existing_new is None:
+                sequence_state[new_seq] = {"freq": old_freq, "pairs": new_pairs}
+            else:
+                # Combine frequencies for identical sequences
+                existing_new_freq: int = existing_new["freq"]  # type: ignore[assignment]
+                existing_new_pairs: Counter = existing_new["pairs"]  # type: ignore[assignment]
+                existing_new["freq"] = existing_new_freq + old_freq
+                # The pair pattern for the same sequence is identical; keep one copy
+                # (no need to merge Counters since they represent structure, not weighted by freq)
+                new_pairs = existing_new_pairs
+
+            # Increase global pair counts by new_pairs weighted by frequency of new_seq component just added
+            for p, c in new_pairs.items():
+                pair_counts[p] += old_freq * c
+
+            # Add new_seq to inverted index for all its pairs
+            for p in new_pairs.keys():
+                seqs = pair_to_sequences.get(p)
+                if seqs is None:
+                    seqs = set()
+                    pair_to_sequences[p] = seqs
+                seqs.add(new_seq)
+
+            # Remove old sequence entry
+            sequence_state.pop(old_seq, None)
+
+        # After processing, best_pair should have no occurrences remaining
+        pair_to_sequences.pop(best_pair, None)
+        pair_counts.pop(best_pair, None)
+
+    return vocab, merges
+
+
 def train_bpe_from_pre_tokens(pre_tokens: Dict[Tuple[bytes, ...], int], vocab_size: int, special_tokens: List[str] = None) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
     """
     Train BPE on pre-token sequences until reaching the target vocabulary size.
@@ -494,8 +599,16 @@ def train_bpe(
     """
     # Use optimized file processing (auto-decides on parallel based on file size)
     pre_tokens = pretokenize_file(input_path, special_tokens)
-    
-    # Train BPE on the pre-tokens
-    vocab, merges = train_bpe_from_pre_tokens(pre_tokens, vocab_size, special_tokens)
+
+    # Choose training backend
+    use_indexed = kwargs.get("use_indexed", False)
+    progress_callback = kwargs.get("progress_callback")
+
+    if use_indexed:
+        vocab, merges = train_bpe_from_pre_tokens_indexed(
+            pre_tokens, vocab_size, special_tokens, progress_callback
+        )
+    else:
+        vocab, merges = train_bpe_from_pre_tokens(pre_tokens, vocab_size, special_tokens)
     
     return vocab, merges
